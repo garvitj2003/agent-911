@@ -262,18 +262,22 @@ async def main():
 
         # Call Interaction Loop
         while True:
-            # 1. Listen to caller
+            # 1. Listen to caller (concurrently with operator speech if active)
             dashboard.set_status("Waiting for caller to speak...")
             user_audio = await audio.record_user_speech(
                 level_callback=dashboard.set_audio_level,
-                status_callback=dashboard.set_status
+                status_callback=dashboard.set_status,
+                transcribe_callback=analyzer.transcribe
             )
             
             # Reset audio level indicator on UI
             dashboard.set_audio_level(0.0)
 
-            transcription = ""
-            if len(user_audio) > 0:
+            # Retrieve transcription from cache if record_user_speech already ran it, otherwise fallback
+            transcription = getattr(audio, "_last_transcription", "")
+            audio._last_transcription = ""  # Clear cache for next turn
+            
+            if not transcription and len(user_audio) > 0:
                 # 2. Transcribe voice
                 dashboard.set_status("Transcribing speech...")
                 transcription = await analyzer.transcribe(user_audio)
@@ -304,12 +308,14 @@ async def main():
             response_text = sanitize_response(response_text)
             dashboard.add_transcript("Operator", response_text)
             dashboard.set_status("Operator Speaking...")
-            await audio.speak(response_text, error_callback=on_tts_error)
+            # Run speaking in background to allow concurrent microphone recording in next loop turn
+            asyncio.create_task(audio.speak(response_text, error_callback=on_tts_error))
 
             # 5. End call if the distributor confirmed help arrived and caller acknowledged
             if call_ended:
                 dashboard.set_status("Call Ended")
                 dashboard.add_transcript("System", "Call terminated. Responders on scene.")
+                audio.stop_speaking()
                 break
 
 

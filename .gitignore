@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Environmental configs
+.env
+
+# Logs and transient test files
+debug.log
+test.wav
+
+# Local scratch directories
+scratch/
