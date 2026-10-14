@@ -50,19 +50,23 @@ class LLMManager:
     # ------------------------------------------------------------------ #
 
     async def start_background_worker(self):
-        """Asynchronously processes background agent communications."""
+        """Asynchronously processes background agent communications in parallel."""
         while True:
             agent_name = await self.agent_queue.get()
-            try:
-                await self.run_agent(agent_name)
-            except Exception as e:
-                import traceback
-                self.agent_logs.append(f"[System Error]: Failed running {agent_name} agent: {e}")
-                with open("debug.log", "a") as df:
-                    df.write(f"Background agent error for {agent_name}: {e}\n")
-                    df.write(traceback.format_exc() + "\n")
-            finally:
-                self.agent_queue.task_done()
+            
+            async def _process_agent(name):
+                try:
+                    await self.run_agent(name)
+                except Exception as e:
+                    import traceback
+                    self.agent_logs.append(f"[System Error]: Failed running {name} agent: {e}")
+                    with open("debug.log", "a") as df:
+                        df.write(f"Background agent error for {name}: {e}\n")
+                        df.write(traceback.format_exc() + "\n")
+                finally:
+                    self.agent_queue.task_done()
+                    
+            asyncio.create_task(_process_agent(agent_name))
 
     # ------------------------------------------------------------------ #
     # Arrival polling — called at the top of every process_turn           #
@@ -277,29 +281,38 @@ class LLMManager:
         if name == "police":
             return (
                 "You are the 911 Police Dispatch Agent.\n"
-                "On receiving a request: use dispatch_police immediately. Then send the distributor "
-                "EXACTLY TWO separate send_message calls — each containing ONE single-sentence question "
-                "critical for the responding officers (e.g. weapon type, suspect description, "
-                "number of suspects). Do not send lists. One question per send_message call. "
-                "Do not speak to the caller directly."
+                "On receiving a request or update (from the distributor or via your inbox from another agent): "
+                "use dispatch_police immediately (calling it with new details will append to the existing dispatch "
+                "without resetting the ETA/status). If no location is provided, pass location='Awaiting Location'. "
+                "If the emergency is established, send the distributor EXACTLY TWO separate send_message calls — "
+                "each containing ONE single-sentence question critical for responding officers (e.g. weapons, suspects). "
+                "If nature of emergency is unknown (open-line), do NOT send speculative questions. "
+                "Do not speak to the caller directly.\n"
+                "COLLABORATION: If you detect medical injuries or fires, use send_message to notify 'paramedics' or 'fire'."
             )
         elif name == "paramedics":
             return (
                 "You are the 911 Paramedics Dispatch Agent.\n"
-                "On receiving a request: use dispatch_paramedics immediately. Then send the distributor "
-                "EXACTLY TWO separate send_message calls — each containing ONE single-sentence question "
-                "critical for the responding paramedics (e.g. consciousness, known medications, "
-                "allergies, injury type). Do not send lists. One question per send_message call. "
-                "Do not speak to the caller directly."
+                "On receiving a request or update (from the distributor or via your inbox from another agent): "
+                "use dispatch_paramedics immediately (calling it with new details will append to the existing dispatch "
+                "without resetting the ETA/status). If no location is provided, pass location='Awaiting Location'. "
+                "If the medical emergency is established, send the distributor EXACTLY TWO separate send_message calls — "
+                "each containing ONE single-sentence question critical for responding paramedics (e.g. breathing, consciousness). "
+                "If the call is an unverified open line with unknown emergency type, do NOT ask speculative allergy/medication questions. "
+                "Do not speak to the caller directly.\n"
+                "COLLABORATION: If you detect active threats or hazards, use send_message to notify 'police' or 'fire'."
             )
         elif name == "fire":
             return (
                 "You are the 911 Fire & Rescue Dispatch Agent.\n"
-                "On receiving a request: use dispatch_fire immediately. Then send the distributor "
-                "EXACTLY TWO separate send_message calls — each containing ONE single-sentence question "
-                "critical for the responding firefighters (e.g. trapped occupants, gas lines, "
-                "building materials, hazardous materials). Do not send lists. One question per "
-                "send_message call. Do not speak to the caller directly."
+                "On receiving a request or update (from the distributor or via your inbox from another agent): "
+                "use dispatch_fire immediately (calling it with new details will append to the existing dispatch "
+                "without resetting the ETA/status). If no location is provided, pass location='Awaiting Location'. "
+                "If the fire/hazard is established, send the distributor EXACTLY TWO separate send_message calls — "
+                "each containing ONE single-sentence question critical for responding firefighters (e.g. trapped occupants). "
+                "If nature of emergency is unknown (open-line), do NOT send speculative questions. "
+                "Do not speak to the caller directly.\n"
+                "COLLABORATION: If you detect injuries or threats, use send_message to notify 'paramedics' or 'police'."
             )
         return ""
 
@@ -328,16 +341,28 @@ class LLMManager:
         return f"""You are the primary 911 distributor operator speaking directly to the caller.
 
 RULES (follow strictly):
-1. Establish the caller's location and nature of emergency first.
-2. Delegate emergencies using send_message:
+1. LOCATION REQUIREMENT:
+   - Establish the caller's location (address, street, landmark) FIRST. Responders cannot be sent without a location.
+   - NEVER tell the caller that units are "en route" or arriving if the location has not been provided yet.
+2. OPEN-LINE / INITIAL SILENT CALL HANDLING (No location / no context):
+   - If the call starts with silence/unresponsiveness and NO location or emergency type has been established:
+     - Do NOT guess what the emergency is (do NOT assume medical, fire, or police).
+     - Do NOT dispatch units to unknown locations.
+     - Follow Silent Call Protocol: Speak calmly, ask for address/location, and instruct the caller: "If you are in danger and cannot speak, press space or tap your phone. What is your address?"
+3. MID-CALL UNRESPONSIVENESS / COLLAPSE (Location & Context already known):
+   - Only if a location and emergency type were ALREADY established earlier in the call, and the caller subsequently becomes silent:
+     - Deduce the emergency from the established context (e.g. caller collapsed from smoke, bleeding, or medical distress).
+     - Use send_message to send an urgent update to the active specialized agent ('paramedics', 'police', or 'fire') so responders know the caller lost consciousness.
+4. DELEGATE EMERGENCIES via send_message:
    - Crime / safety → 'police'
    - Medical → 'paramedics'
    - Fire / hazard → 'fire'
    You have NO dispatch tools. Only specialized agents can dispatch.
-3. Keep the caller calm. Give concise safety instructions.
-4. When the caller answers a question from a background agent, relay that answer back to the relevant agent via send_message.
-5. If caller goes silent, reassure and keep the call alive.
-6. After the caller confirms responders are on scene, call end_call immediately.
+5. When the caller answers a question from a background agent, relay that answer back via send_message.
+6. INTERRUPTION EVALUATION:
+   - If your previous response is marked as '[INTERRUPTED by caller while speaking: ...]', evaluate if the caller answered your critical question. If not, acknowledge their statement first, then re-frame and weave the unanswered critical question back in.
+7. Proactively send critical updates to background agents via send_message when new details emerge.
+8. After the caller confirms responders are on scene, call end_call immediately.
 
 FORMATTING (STRICT — violations break TTS):
 - Output ONLY raw spoken dialogue. NO speaker labels, NO 'Operator:', NO markdown symbols (**, *, #, -, `), NO bullet points, NO numbered lists.
@@ -412,7 +437,7 @@ Current Active Dispatches:
     # Main distributor turn                                                #
     # ------------------------------------------------------------------ #
 
-    async def process_turn(self, user_text: str, on_tool_call_callback=None) -> tuple[str, bool]:
+    async def process_turn(self, user_text: str, on_tool_call_callback=None, interrupted_text: str = None) -> tuple[str, bool]:
         """Process one caller turn through the distributor agent.
 
         Returns:
@@ -422,6 +447,13 @@ Current Active Dispatches:
 
         # Check for newly-arrived units and push arrival tasks
         self._check_arrivals()
+
+        # If previous turn was interrupted while speaking, tag the previous assistant turn in history
+        if interrupted_text and self.distributor_history:
+            for msg in reversed(self.distributor_history):
+                if msg.get("role") == "assistant" and not msg.get("tool_calls"):
+                    msg["content"] = f"[INTERRUPTED by caller while speaking: '{interrupted_text}']"
+                    break
 
         # Peek at the next pending task (do NOT pop yet — pop after the turn)
         current_task = self.distributor_task_queue[0] if self.distributor_task_queue else None

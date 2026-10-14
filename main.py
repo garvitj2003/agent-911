@@ -46,11 +46,48 @@ from rich.live import Live
 from rich.text import Text
 from rich.table import Table
 
+import select
+import tty
+import termios
+import time
+import numpy as np
+
 # Import our custom modules
 from audio_manager import AudioManager
 from speech_analyzer import SpeechAnalyzer
 from dispatch_manager import DispatchManager
 from llm_manager import LLMManager
+
+class TerminalInputManager:
+    """Manages non-blocking keyboard input for Push-to-Talk and interruption in terminal."""
+    def __init__(self):
+        self.old_settings = None
+        self.is_raw = False
+
+    def enable_cbreak(self):
+        try:
+            if sys.stdin.isatty():
+                self.old_settings = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+                self.is_raw = True
+        except Exception:
+            pass
+
+    def restore(self):
+        try:
+            if self.is_raw and self.old_settings and sys.stdin.isatty():
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+                self.is_raw = False
+        except Exception:
+            pass
+
+    def check_key(self) -> str | None:
+        try:
+            if sys.stdin.isatty() and select.select([sys.stdin], [], [], 0)[0]:
+                return sys.stdin.read(1)
+        except Exception:
+            pass
+        return None
 
 class Dashboard:
     def __init__(self, dispatch_manager):
@@ -173,7 +210,7 @@ class Dashboard:
             audio_color = "yellow"
             
         audio_bar_text = Text(f"Mic Level: [{bar}]", style=f"bold {audio_color}")
-        status_text = Text(f"Status: {self.status}", style="bold white")
+        status_text = Text(f"Status: {self.status}\n[SPACE]: Push-to-Talk / Interrupt Operator | [q]: Quit", style="bold white")
         
         footer_grid.add_row(status_text, audio_bar_text)
         
@@ -260,63 +297,148 @@ async def main():
         dashboard.set_status("Operator Speaking...")
         await audio.speak(greeting, error_callback=on_tts_error)
 
-        # Call Interaction Loop
-        while True:
-            # 1. Listen to caller (concurrently with operator speech if active)
-            dashboard.set_status("Waiting for caller to speak...")
-            user_audio = await audio.record_user_speech(
-                level_callback=dashboard.set_audio_level,
-                status_callback=dashboard.set_status,
-                transcribe_callback=analyzer.transcribe
-            )
-            
-            # Reset audio level indicator on UI
-            dashboard.set_audio_level(0.0)
+        input_mgr = TerminalInputManager()
+        input_mgr.enable_cbreak()
 
-            # Retrieve transcription from cache if record_user_speech already ran it, otherwise fallback
-            transcription = getattr(audio, "_last_transcription", "")
-            audio._last_transcription = ""  # Clear cache for next turn
-            
-            if not transcription and len(user_audio) > 0:
-                # 2. Transcribe voice
-                dashboard.set_status("Transcribing speech...")
-                transcription = await analyzer.transcribe(user_audio)
-            
-            if not transcription or transcription.strip() == "":
-                transcription = "[Caller is silent or unresponsive]"
-                dashboard.add_transcript("System", "No speech detected (caller is silent).")
-            else:
-                dashboard.add_transcript("Caller", transcription)
+        silence_timer_start = time.time()
+        silence_state = "NORMAL"  # "NORMAL", "CHECK_IN", "MONITORING"
+        has_caller_spoken_yet = False
+        SILENCE_LIMIT_NORMAL = 15.0
+        SILENCE_LIMIT_CHECK_IN = 5.0
+        SILENCE_LIMIT_MONITORING = 25.0
 
-            # 3. Think / Generate Response (Gemini)
-            dashboard.set_status("Operator thinking...")
-            
-            def on_tool_call(name, args):
-                service = args.get("service_type", "emergency unit")
-                loc = args.get("location", "specified location")
-                details = args.get("details", "")
-                details_str = f" ({details})" if details else ""
-                dashboard.add_transcript("System", f"📢 Tool Invoked: Dispatched {service} to {loc}{details_str}")
+        try:
+            # Call Interaction Loop
+            while True:
+                if silence_state == "CHECK_IN":
+                    current_limit = SILENCE_LIMIT_CHECK_IN
+                    dashboard.set_status("Awaiting check-in response (Press SPACE to speak)...")
+                elif silence_state == "MONITORING":
+                    current_limit = SILENCE_LIMIT_MONITORING
+                    dashboard.set_status("Monitoring line (Press SPACE to speak / interrupt)...")
+                else:
+                    current_limit = SILENCE_LIMIT_NORMAL
+                    dashboard.set_status("Awaiting caller (Press SPACE to speak / interrupt)...")
 
-            try:
-                response_text, call_ended = await llm.process_turn(transcription, on_tool_call_callback=on_tool_call)
-            except Exception as e:
-                response_text, call_ended = "We are experiencing technical issues with the dispatch system, but help is being coordinated. Please stay calm.", False
-                dashboard.add_transcript("System", f"LLM API Error: {e}")
+                user_triggered_speech = False
+                user_audio = np.array([], dtype='float32')
 
-            # 4. Sanitize and speak response
-            response_text = sanitize_response(response_text)
-            dashboard.add_transcript("Operator", response_text)
-            dashboard.set_status("Operator Speaking...")
-            # Run speaking in background to allow concurrent microphone recording in next loop turn
-            asyncio.create_task(audio.speak(response_text, error_callback=on_tts_error))
+                # Inner polling loop: checks keypresses and countdown timer
+                while True:
+                    if audio.is_speaking():
+                        silence_timer_start = time.time()
 
-            # 5. End call if the distributor confirmed help arrived and caller acknowledged
-            if call_ended:
-                dashboard.set_status("Call Ended")
-                dashboard.add_transcript("System", "Call terminated. Responders on scene.")
-                audio.stop_speaking()
-                break
+                    elapsed_silence = time.time() - silence_timer_start if not audio.is_speaking() else 0.0
+
+                    k = input_mgr.check_key()
+                    if k == 'q':
+                        dashboard.set_status("Call Ended by User")
+                        audio.stop_speaking()
+                        return
+                    elif k in (' ', '\n', '\r'):
+                        # Instantly stop TTS if operator is speaking
+                        if audio.is_speaking():
+                            audio.stop_speaking()
+
+                        # Record PTT audio
+                        dashboard.set_status("🎙️ Recording Speech (Press SPACE/ENTER when done)...")
+                        user_audio = await asyncio.to_thread(
+                            audio.record_ptt_speech,
+                            level_callback=dashboard.set_audio_level,
+                            status_callback=dashboard.set_status,
+                            key_check_fn=input_mgr.check_key
+                        )
+                        dashboard.set_audio_level(0.0)
+                        user_triggered_speech = True
+                        break
+
+                    if not audio.is_speaking() and elapsed_silence >= current_limit:
+                        break
+
+                    await asyncio.sleep(0.05)
+
+                interrupted_text = audio.get_and_clear_interrupted_text()
+                transcription = ""
+
+                if user_triggered_speech and len(user_audio) > 0:
+                    dashboard.set_status("Transcribing speech...")
+                    transcription = await analyzer.transcribe(user_audio)
+
+                is_valid_speech = bool(
+                    transcription
+                    and transcription.strip() != ""
+                    and not transcription.startswith("[Groq STT failed")
+                    and not transcription.startswith("[Caller is silent")
+                )
+
+                if is_valid_speech:
+                    dashboard.add_transcript("Caller", transcription)
+                    has_caller_spoken_yet = True
+                    silence_state = "NORMAL"
+                    silence_timer_start = time.time()
+                    prompt_input = transcription
+                else:
+                    if silence_state == "NORMAL":
+                        # Stage 1 Timeout reached -> Trigger check-in
+                        silence_state = "CHECK_IN"
+                        dashboard.add_transcript("System", "⏰ Caller silent for 15s. Triggering check-in...")
+                        if not has_caller_spoken_yet:
+                            prompt_input = "[SYSTEM ALERT: Open-line silence. The caller has been silent for 15 seconds without speaking or providing a location. Ask a short check-in question instructing them to speak, press space, or tap if they need emergency assistance.]"
+                        else:
+                            prompt_input = "[SYSTEM ALERT: Mid-call silence. The caller has stopped speaking for 15 seconds. Ask a short check-in question to confirm if they are still on the line.]"
+                    elif silence_state == "CHECK_IN":
+                        # Stage 2 Timeout reached -> Transition to MONITORING
+                        silence_state = "MONITORING"
+                        if not has_caller_spoken_yet:
+                            dashboard.add_transcript("System", "📞 Open-line unverified. Holding line and requesting location...")
+                            prompt_input = "[SYSTEM ALERT: Open-line unverified. The caller failed to respond to the check-in and no location or emergency type has been provided. Tell the caller you are holding the line, explain that you need their location/address to send help, and instruct them to press space or tap if in danger. Do NOT dispatch units or say units are en route.]"
+                        else:
+                            dashboard.add_transcript("System", "🚨 Mid-call silence: Auto-escalating with emergency update...")
+                            prompt_input = "[CRITICAL ALERT: Mid-call unresponsiveness. The caller failed to respond to check-in. Based on the emergency context established earlier, deduce the emergency (e.g. lost consciousness/collapsed), alert the specialized agent via send_message, and reassure the caller that help is on the way.]"
+                    elif silence_state == "MONITORING":
+                        # In monitoring mode, send brief periodic reassurance without looping into the check-in
+                        if not has_caller_spoken_yet:
+                            prompt_input = "[SYSTEM ALERT: Open-line holding. Reassure the caller you are still on the line waiting for their location. Keep it to one short sentence. Do not repeat long questions.]"
+                        else:
+                            prompt_input = "[SYSTEM ALERT: Periodic reassurance. Reassure the caller in one short sentence that emergency units are en route and to stay calm.]"
+                    else:
+                        prompt_input = "[Caller is silent or unresponsive]"
+
+                # 3. Think / Generate Response
+                dashboard.set_status("Operator thinking...")
+
+                def on_tool_call(name, args):
+                    service = args.get("service_type", "emergency unit")
+                    loc = args.get("location", "specified location")
+                    details = args.get("details", "")
+                    details_str = f" ({details})" if details else ""
+                    dashboard.add_transcript("System", f"📢 Tool Invoked: Dispatched {service} to {loc}{details_str}")
+
+                try:
+                    response_text, call_ended = await llm.process_turn(
+                        prompt_input,
+                        on_tool_call_callback=on_tool_call,
+                        interrupted_text=interrupted_text
+                    )
+                except Exception as e:
+                    response_text, call_ended = "We are coordinating emergency responders to your location. Please stay on the line.", False
+                    dashboard.add_transcript("System", f"LLM API Error: {e}")
+
+                # 4. Sanitize and speak response
+                response_text = sanitize_response(response_text)
+                dashboard.add_transcript("Operator", response_text)
+                dashboard.set_status("Operator Speaking...")
+                asyncio.create_task(audio.speak(response_text, error_callback=on_tts_error))
+                silence_timer_start = time.time()
+
+                # 5. End call if responders confirmed
+                if call_ended:
+                    dashboard.set_status("Call Ended")
+                    dashboard.add_transcript("System", "Call terminated. Responders on scene.")
+                    audio.stop_speaking()
+                    break
+        finally:
+            input_mgr.restore()
 
 
 if __name__ == "__main__":

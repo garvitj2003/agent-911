@@ -19,6 +19,8 @@ class AudioManager:
         self.is_prod = os.getenv("PROD", "true").strip().lower() != "false"
         self.active_playback_process = None
         self._last_transcription = ""
+        self.was_interrupted = False
+        self.current_speaking_text = ""
 
     def is_speaking(self) -> bool:
         if self.active_playback_process is not None:
@@ -30,6 +32,7 @@ class AudioManager:
 
     def stop_speaking(self):
         if self.active_playback_process is not None:
+            self.was_interrupted = True
             try:
                 self.active_playback_process.terminate()
                 try:
@@ -41,10 +44,24 @@ class AudioManager:
             finally:
                 self.active_playback_process = None
 
+    def get_and_clear_interrupted_text(self) -> str | None:
+        """Returns the text that was interrupted by the caller, or None if speech finished naturally."""
+        if self.was_interrupted and self.current_speaking_text:
+            text = self.current_speaking_text
+            self.was_interrupted = False
+            self.current_speaking_text = ""
+            return text
+        self.was_interrupted = False
+        self.current_speaking_text = ""
+        return None
+
     async def speak(self, text: str, error_callback=None):
         """Generates TTS audio using ElevenLabs API and plays it via mpv in the background."""
         if not self.is_prod:
             return
+            
+        self.current_speaking_text = text
+        self.was_interrupted = False
             
         loop = asyncio.get_running_loop()
         def _speak():
@@ -103,6 +120,8 @@ class AudioManager:
                     loop.call_soon_threadsafe(error_callback, err_msg)
             finally:
                 self.active_playback_process = None
+                if not self.was_interrupted:
+                    self.current_speaking_text = ""
                 if os.path.exists(temp_path):
                     try:
                         os.unlink(temp_path)
@@ -110,6 +129,53 @@ class AudioManager:
                         pass
         await loop.run_in_executor(None, _speak)
 
+    def record_ptt_speech(self, level_callback=None, status_callback=None, key_check_fn=None, max_duration=20.0) -> np.ndarray:
+        """Records microphone audio in Push-to-Talk mode until user presses key again or pauses."""
+        block_size = 1024
+        chunk_duration = block_size / self.sample_rate
+        max_chunks = int(max_duration / chunk_duration)
+        speech_buffer = []
+        silence_after_speech_counter = 0
+        silence_threshold = self.background_noise * 2.5 + 0.005
+        has_spoken = False
+
+        if status_callback:
+            status_callback("🎙️ Recording PTT (Press SPACE/ENTER when done)...")
+
+        try:
+            with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype='float32', blocksize=block_size) as stream:
+                for chunk_idx in range(max_chunks):
+                    data, overflowed = stream.read(block_size)
+                    rms = np.sqrt(np.mean(data**2))
+                    speech_buffer.append(data)
+                    
+                    if level_callback:
+                        level_callback(rms)
+                        
+                    if rms > silence_threshold:
+                        has_spoken = True
+                        silence_after_speech_counter = 0
+                    else:
+                        if has_spoken:
+                            silence_after_speech_counter += 1
+                    
+                    # Stop if key pressed again after initial 0.3s
+                    if chunk_idx > int(0.3 / chunk_duration) and key_check_fn:
+                        k = key_check_fn()
+                        if k in (' ', '\n', '\r', 'q'):
+                            break
+                            
+                    # Auto stop if user finished speaking and stayed silent for >2.0s
+                    if has_spoken and silence_after_speech_counter > int(2.0 / chunk_duration):
+                        break
+        except Exception as e:
+            if status_callback:
+                status_callback(f"Audio error: {e}")
+            return np.array([], dtype='float32')
+
+        if not speech_buffer:
+            return np.array([], dtype='float32')
+        return np.concatenate(speech_buffer, axis=0).flatten()
 
     async def calibrate_noise(self, duration=1.5) -> float:
         """Calibrate background noise levels to establish VAD threshold."""
